@@ -12,6 +12,7 @@ and Deploy use that same convention. Physical frequency and wavenumber are posit
 | Burton-Miller coupling | `-i/k` |
 | Passive FEM bulk loss | `K - k^2 M + i eta k^2 M` |
 | Surface admittance contribution | `+i rho omega Y B` |
+| Interface transfer impedance | `p_FEM - p_BEM = (R + i omega M) v_n` |
 | Plane-wave termination | `q = -i k p` |
 | Electrical impedance | `R + i omega L` |
 | Mechanical impedance | `R + i(omega M - 1/(omega C))` |

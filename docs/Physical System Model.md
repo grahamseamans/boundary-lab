@@ -233,6 +233,51 @@ $$
 Coordinate matching alone is not sufficient. The coupled solver must also
 transfer quantities correctly between the FEM and BEM basis spaces.
 
+### Transfer-impedance layers
+
+A thin resistive sheet across an opening (felt, acoustic cloth, a fine screen)
+is a two-sided element, not a one-sided `impedance` wall. It is a property of
+the interface, set on the interface's bounded (FEM-side) boundary:
+
+```json
+{
+  "id": "boundary:fem-port",
+  "kind": "interface",
+  "parameters": {
+    "transfer_impedance": {
+      "model": "resistance_mass",
+      "resistance_pa_s_per_m": 125.0,
+      "mass_kg_per_m2": 0.004
+    }
+  }
+}
+```
+
+The interface then enforces a pressure jump instead of continuity, with normal
+velocity still continuous:
+
+$$
+p_\mathrm{FEM}-p_\mathrm{BEM}=Z_s\,v_n,\qquad Z_s=R+i\omega M
+$$
+
+in the `exp(+i omega t)` convention, with \(v_n\) along the bounded region's
+outward normal. `R` (Pa·s/m, MKS rayl) and `M` (kg/m²) are referred to the
+interface face area: a sheet that covers only part of the opening, or sits at
+a different plane, must be scaled to it. All three keys are required, both
+values finite and non-negative. Layers on the unbounded side, on non-interface
+boundaries, or with other keys are rejected. The layer is a locally reacting
+sheet: no lateral propagation, no frequency dependence beyond `R + i omega M`,
+no nonlinearity.
+
+Layers need a BEAT Engine that advertises the `interface_transfer_impedance`
+worker capability; an engine without it would ignore the parameter, so the
+submission is refused instead. Each result's diagnostics carry
+`interface_transfer_impedance` (R, M, Z_s per layer) and Boundary Lab fails a
+result that does not echo the requested layers. With a layer present,
+`pressure_continuity_error` is the residual of the jump condition. Headless
+projects set the parameter in the project file; the System dialog shows and
+keeps it but does not edit it.
+
 An ordinary open port mouth is therefore an interface, not a component. It
 connects two air domains but does not introduce an independent mechanical
 device.

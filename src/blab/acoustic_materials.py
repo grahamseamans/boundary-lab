@@ -9,6 +9,10 @@ REGION_BULK_LOSS_FACTOR_KEY = "bulk_loss_factor"
 FEM_BULK_LOSS_FACTOR_OPTIONS = (0.0, 0.002, 0.005, 0.01, 0.02, 0.05)
 WALL_IMPEDANCE_KEY = "wall_impedance"
 WALL_IMPEDANCE_MODEL_MIKI = "miki"
+TRANSFER_IMPEDANCE_KEY = "transfer_impedance"
+TRANSFER_IMPEDANCE_MODEL_RESISTANCE_MASS = "resistance_mass"
+TRANSFER_IMPEDANCE_RESISTANCE_KEY = "resistance_pa_s_per_m"
+TRANSFER_IMPEDANCE_MASS_KEY = "mass_kg_per_m2"
 
 DEFAULT_WALL_LINING_THICKNESS_M = 0.03
 DEFAULT_WALL_LINING_FLOW_RESISTIVITY_PA_S_PER_M2 = 5_000.0
@@ -77,3 +81,63 @@ def miki_wall_impedance_parameters(
     )
     assert normalized is not None
     return {WALL_IMPEDANCE_KEY: normalized}
+
+
+def transfer_impedance_parameters(parameters: Mapping[str, Any] | None) -> dict[str, float | str] | None:
+    """Return a normalized interface transfer-impedance layer, or ``None``.
+
+    The layer is a thin two-sided resistive/inertive sheet across an FEM-BEM
+    interface: ``p_bounded - p_unbounded = (R + i omega M) v_n`` in
+    ``exp(+i omega t)``, with ``v_n`` along the bounded region's outward
+    normal. ``R`` (Pa s/m) and ``M`` (kg/m^2) are referred to the interface
+    face area. Every key is required; unknown keys are refused, matching the
+    engine's parser.
+    """
+
+    if not parameters or TRANSFER_IMPEDANCE_KEY not in parameters:
+        return None
+    raw = parameters[TRANSFER_IMPEDANCE_KEY]
+    if not isinstance(raw, Mapping):
+        raise ValueError("Transfer impedance parameters must be an object.")
+    expected = {"model", TRANSFER_IMPEDANCE_RESISTANCE_KEY, TRANSFER_IMPEDANCE_MASS_KEY}
+    if set(raw) != expected:
+        raise ValueError(
+            "Transfer impedance parameters must have exactly the keys "
+            + ", ".join(sorted(expected))
+            + f"; found {', '.join(sorted(map(str, raw))) or 'none'}."
+        )
+    if raw["model"] != TRANSFER_IMPEDANCE_MODEL_RESISTANCE_MASS:
+        raise ValueError(
+            f"Unsupported transfer impedance model {raw['model']!r}; "
+            f"expected {TRANSFER_IMPEDANCE_MODEL_RESISTANCE_MASS!r}."
+        )
+    values = {}
+    for key in (TRANSFER_IMPEDANCE_RESISTANCE_KEY, TRANSFER_IMPEDANCE_MASS_KEY):
+        value = raw[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Transfer impedance {key} must be a finite non-negative number.")
+        value = float(value)
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"Transfer impedance {key} must be a finite non-negative number.")
+        values[key] = value
+    return {"model": TRANSFER_IMPEDANCE_MODEL_RESISTANCE_MASS, **values}
+
+
+def resistance_mass_transfer_impedance_parameters(
+    *,
+    resistance_pa_s_per_m: float,
+    mass_kg_per_m2: float = 0.0,
+) -> dict[str, dict[str, float | str]]:
+    """Build normalized boundary parameters for a resistance-mass interface layer."""
+
+    normalized = transfer_impedance_parameters(
+        {
+            TRANSFER_IMPEDANCE_KEY: {
+                "model": TRANSFER_IMPEDANCE_MODEL_RESISTANCE_MASS,
+                TRANSFER_IMPEDANCE_RESISTANCE_KEY: resistance_pa_s_per_m,
+                TRANSFER_IMPEDANCE_MASS_KEY: mass_kg_per_m2,
+            }
+        }
+    )
+    assert normalized is not None
+    return {TRANSFER_IMPEDANCE_KEY: normalized}

@@ -17,8 +17,10 @@ from blab.acoustic_impedance import (
 )
 from blab.acoustic_materials import (
     REGION_BULK_LOSS_FACTOR_KEY,
+    TRANSFER_IMPEDANCE_KEY,
     WALL_IMPEDANCE_KEY,
     region_bulk_loss_factor,
+    transfer_impedance_parameters,
     wall_impedance_parameters,
 )
 from blab.component_symmetry import (
@@ -280,6 +282,19 @@ class PhysicalSystemCompiler:
                     issues.append(f"Boundary '{boundary.id}' wall impedance requires a rigid assignment.")
                 try:
                     wall_impedance_parameters(boundary.parameters)
+                except ValueError as exc:
+                    issues.append(f"Boundary '{boundary.id}' {exc}")
+            if TRANSFER_IMPEDANCE_KEY in boundary.parameters:
+                # A two-sided layer across an FEM-BEM interface; the engine reads it on the bounded side only.
+                if region.kind != AcousticRegionKind.BOUNDED_AIR:
+                    issues.append(
+                        f"Boundary '{boundary.id}' transfer impedance belongs on the bounded (FEM) side of an "
+                        "interface, not the unbounded side."
+                    )
+                if boundary.kind != BoundaryKind.INTERFACE:
+                    issues.append(f"Boundary '{boundary.id}' transfer impedance requires an interface assignment.")
+                try:
+                    transfer_impedance_parameters(boundary.parameters)
                 except ValueError as exc:
                     issues.append(f"Boundary '{boundary.id}' {exc}")
 
@@ -856,6 +871,13 @@ class PhysicalSystemCompiler:
                 PhysicsAssumption(
                     AssumptionStatus.INCLUDED,
                     "Locally reacting rigid-backed Miki porous wall treatments",
+                )
+            )
+        if any(transfer_impedance_parameters(boundary.parameters) is not None for boundary in system.boundaries):
+            assumptions.append(
+                PhysicsAssumption(
+                    AssumptionStatus.INCLUDED,
+                    "Locally reacting thin transfer-impedance layers on FEM-BEM interfaces (R + i omega M)",
                 )
             )
         if any(boundary.kind == BoundaryKind.PLANE_WAVE_TUBE_TERMINATION for boundary in system.boundaries):

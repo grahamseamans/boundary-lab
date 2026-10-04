@@ -235,6 +235,17 @@ or frame elasticity. The UI defaults of 30 mm and 5,000 Pa·s/m² are a useful
 starting approximation for typical loose loudspeaker cabinet lining, not a
 material specification.
 
+An interface may carry a thin transfer-impedance layer (see
+[Physical System Model](Physical%20System%20Model.md#transfer-impedance-layers)):
+`p_FEM - p_BEM = Z_s v_n` with `Z_s = R + i omega M`. Since
+`q = -i rho omega v_n`, each interface flux row gains a diagonal entry
+`-d q` with `d = Z_s / (-i rho omega) = i R/(rho omega) - M/rho`; there are no
+new unknowns and the FEM Schur condensation is unchanged. The monolithic,
+CUDA/ROCm and condensed `:none`/`:pressure` paths support it; `:flux`
+interface elimination falls back to `:pressure` under `auto` and refuses
+under `on`, and the speaker ROM refuses layers. With `R = M = 0` exactly the
+results are those of plain continuity.
+
 Only tetrahedra in the selected physical volume groups are retained. Each
 domain's vertices and facets are compacted, and boundary tags are remapped into
 a collision-free aggregate namespace before assembly.
@@ -640,7 +651,8 @@ following are not implemented by the current coupled backend and are normally
 rejected during application preparation or backend validation:
 
 - general impedance boundary kinds or arbitrary impedance functions (the Miki
-  rigid-backed treatment on bounded rigid walls is supported);
+  rigid-backed treatment on bounded rigid walls and resistance-mass
+  transfer-impedance layers on FEM-BEM interfaces are supported);
 - spatially varying acoustic material loss within one FEM region (one
   homogeneous bulk-loss factor per bounded region is supported);
 - `Mms` input or automatic conversion from conventional T/S parameter sets;

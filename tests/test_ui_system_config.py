@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QApplication, QComboBox, QPushButton
 import blab.ui.component_editor as component_editor_module
 import blab.ui.system_config as system_config_module
 import blab.ui.system_solve as system_solve_module
-from blab.acoustic_materials import miki_wall_impedance_parameters
+from blab.acoustic_materials import miki_wall_impedance_parameters, resistance_mass_transfer_impedance_parameters
 from blab.ath import read_surface_physical_names
 from blab.config import RadiatorConfig
 from blab.interface_conform import InterfaceConformError, validate_conforming_interfaces
@@ -1389,6 +1389,40 @@ def test_combined_plane_requests_both_fem_and_bem_spatial_fields() -> None:
     domain_ids = {domain.id for domain in prepared.result_domains}
     assert {BEM_BOUNDARY_PRESSURE_ID, BEM_BOUNDARY_NEUMANN_ID, FEM_NODAL_PRESSURE_ID} <= output_ids
     assert {BEM_BOUNDARY_DOMAIN_ID, FEM_VOLUME_DOMAIN_ID} <= domain_ids
+
+
+def test_system_dialog_shows_and_keeps_an_interface_transfer_impedance_layer() -> None:
+    dialog = _configured_fixture_dialog()
+    layer = resistance_mass_transfer_impedance_parameters(resistance_pa_s_per_m=125.0, mass_kg_per_m2=0.004)
+    interface_row = next(
+        row
+        for row in range(dialog.boundaries_table.rowCount())
+        if dialog.boundaries_table.item(row, 1).text() == "Interior"
+        and dialog.boundaries_table.item(row, 2).text() == "Interface"
+    )
+    button = dialog.boundaries_table.cellWidget(interface_row, 4)
+    assignment_combo = dialog.boundaries_table.cellWidget(interface_row, 3)
+    assert isinstance(button, QPushButton)
+    assert isinstance(assignment_combo, QComboBox)
+    button.setProperty("boundary_parameters", layer)
+    dialog._refresh_wall_impedance_button(button, assignment_combo, True)
+    assert button.text() == "Layer 125 Pa·s/m / 0.004 kg/m²"
+    assert not button.isEnabled()
+
+    system = dialog.physical_system()
+    boundary = next(
+        boundary
+        for boundary in system.boundaries
+        if boundary.group.name == "Interface"
+        and boundary.region_id in {r.id for r in system.regions if r.kind == AcousticRegionKind.BOUNDED_AIR}
+    )
+    assert boundary.parameters == layer
+
+    # physical_system() rebuilt the table, so fetch the row's combo again.
+    assignment_combo = dialog.boundaries_table.cellWidget(interface_row, 3)
+    assignment_combo.setCurrentIndex(assignment_combo.findData(BoundaryKind.RIGID))
+    rigid = next(b for b in dialog.physical_system().boundaries if b.id == boundary.id)
+    assert rigid.parameters == {}
 
 
 def test_system_dialog_edits_region_loss_and_rigid_wall_impedance() -> None:

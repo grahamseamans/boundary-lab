@@ -17,8 +17,10 @@ import numpy as np
 
 from blab.acoustic_materials import (
     REGION_BULK_LOSS_FACTOR_KEY,
+    TRANSFER_IMPEDANCE_KEY,
     WALL_IMPEDANCE_KEY,
     region_bulk_loss_factor,
+    transfer_impedance_parameters,
     wall_impedance_parameters,
 )
 from blab.config import DEFAULT_CHANNEL_VOLTAGE_V
@@ -91,6 +93,53 @@ LUMPED_SEALED_REAR_CHAMBER_PARAMETERS = {
 }
 
 
+def requested_transfer_impedances(request: SystemSolveRequest) -> dict[str, dict[str, float | str]]:
+    """Return the request's interface transfer-impedance layers by bounded boundary id."""
+
+    layers = {}
+    for boundary in request.compiled_system.boundaries:
+        layer = transfer_impedance_parameters(boundary.parameters)
+        if layer is not None:
+            layers[boundary.id] = layer
+    return layers
+
+
+def check_transfer_impedance_diagnostics(request: SystemSolveRequest, freq_hz: float, diagnostics: dict) -> None:
+    """Fail unless the engine reports solving exactly the requested transfer-impedance layers.
+
+    The capability negotiation already refuses an engine without the feature; this read-back
+    catches any path that dropped or altered a layer between the request and the matrix.
+    """
+
+    requested = requested_transfer_impedances(request)
+    reported = diagnostics.get("interface_transfer_impedance")
+    if not requested:
+        if reported is not None:
+            raise RuntimeError(
+                f"BEAT reported interface transfer-impedance layers at {freq_hz:g} Hz for a request without any."
+            )
+        return
+    if not isinstance(reported, dict) or not isinstance(reported.get("layers"), list):
+        raise RuntimeError(
+            f"BEAT returned no interface_transfer_impedance diagnostics at {freq_hz:g} Hz although the request "
+            "carries transfer-impedance layers; the engine may have solved without them."
+        )
+    by_boundary = {layer.get("boundary_id"): layer for layer in reported["layers"] if isinstance(layer, dict)}
+    if set(by_boundary) != set(requested) or len(by_boundary) != len(reported["layers"]):
+        raise RuntimeError(
+            f"BEAT solved transfer-impedance layers on {sorted(map(str, by_boundary))} at {freq_hz:g} Hz; "
+            f"requested {sorted(requested)}."
+        )
+    for boundary_id, layer in requested.items():
+        for key in ("resistance_pa_s_per_m", "mass_kg_per_m2"):
+            # The engine echoes the value it solved with, rounded to the solve precision (FP32 in production).
+            if not math.isclose(float(by_boundary[boundary_id].get(key, math.nan)), float(layer[key]), rel_tol=1e-6):
+                raise RuntimeError(
+                    f"BEAT solved boundary '{boundary_id}' with {key} = {by_boundary[boundary_id].get(key)!r} "
+                    f"at {freq_hz:g} Hz; requested {layer[key]!r}."
+                )
+
+
 class CoupledSession:
     def __init__(
         self,
@@ -158,6 +207,13 @@ class CoupledSession:
         if self.persistent_worker:
             yield from self._solve_stream_persistent(stop_requested=stop_requested)
             return
+        if requested_transfer_impedances(self.request):
+            # The one-shot stdin path never sees the worker's capabilities, so an engine without
+            # transfer-impedance support would solve without the layers instead of failing.
+            raise RuntimeError(
+                "Interface transfer-impedance layers need the persistent BEAT worker, which negotiates the "
+                "interface_transfer_impedance capability; the one-shot solver path cannot check it."
+            )
 
         payload = system_solve_request_to_dict(self.request)
         command = [self.julia_executable]
@@ -215,6 +271,7 @@ class CoupledSession:
                 "Nearly coincident vertices or degenerate triangles can cause this. "
                 "Try mesh Auto-repair; if cleanup was already attempted, inspect or remesh the affected surfaces."
             )
+        check_transfer_impedance_diagnostics(self.request, result.freq_hz, result.diagnostics)
         return result
 
     def _solve_stream_persistent(
@@ -467,17 +524,28 @@ def validate_coupled_capabilities(request: SystemSolveRequest) -> None:
     parameterized_boundaries = [
         boundary.id
         for boundary in system.boundaries
-        if boundary.parameters and set(boundary.parameters) != {WALL_IMPEDANCE_KEY}
+        if boundary.parameters
+        and set(boundary.parameters) != {WALL_IMPEDANCE_KEY}
+        and set(boundary.parameters) != {TRANSFER_IMPEDANCE_KEY}
     ]
     if parameterized_boundaries:
         raise ValueError(
             "Coupled solver does not support the boundary parameters used by: " + ", ".join(parameterized_boundaries)
         )
+    bounded_interface_boundary_ids = {interface.bounded_boundary_id for interface in system.interfaces}
     for boundary in system.boundaries:
+        region = region_by_id[boundary.region_id]
+        if transfer_impedance_parameters(boundary.parameters) is not None and (
+            boundary.kind != BoundaryKind.INTERFACE
+            or region.kind != AcousticRegionKind.BOUNDED_AIR
+            or boundary.id not in bounded_interface_boundary_ids
+        ):
+            raise ValueError(
+                f"Transfer impedance boundary '{boundary.id}' must be the bounded (FEM) side of an acoustic interface."
+            )
         treatment = wall_impedance_parameters(boundary.parameters)
         if treatment is None:
             continue
-        region = region_by_id[boundary.region_id]
         if boundary.kind != BoundaryKind.RIGID or region.kind != AcousticRegionKind.BOUNDED_AIR:
             raise ValueError(f"Wall impedance boundary '{boundary.id}' must be rigid and belong to bounded air.")
     for region in system.regions:

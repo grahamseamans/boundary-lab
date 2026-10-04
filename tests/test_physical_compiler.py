@@ -11,7 +11,7 @@ import pytest
 from beat_engine import beat_contract
 
 from blab.acoustic_impedance import normalization_records
-from blab.acoustic_materials import miki_wall_impedance_parameters
+from blab.acoustic_materials import miki_wall_impedance_parameters, resistance_mass_transfer_impedance_parameters
 from blab.config import ChannelConfig, MeshConfig, RadiatorConfig, SimulationConfig
 from blab.interface_conform import conform_bem_interface_to_fem
 from blab.physical_compiler import PhysicalModelCompileError, PhysicalSystemCompiler
@@ -44,7 +44,9 @@ from blab.solvers.coupled_backend import (
     DEFAULT_TRANSDUCER_REFERENCE_VOLTAGE_V,
     CoupledProductionBackend,
     CoupledReferenceBackend,
+    check_transfer_impedance_diagnostics,
 )
+from blab.solvers.engine_contract import WorkerCompatibilityError, negotiate_submission
 from blab.system_contract import (
     OutputRequest,
     QuantityResult,
@@ -512,6 +514,153 @@ def test_coupled_backend_accepts_region_fem_bulk_loss_and_wall_impedance() -> No
     assumptions = {item.statement for item in compiled.assumptions}
     assert "Homogeneous per-region FEM bulk loss" in assumptions
     assert "Locally reacting rigid-backed Miki porous wall treatments" in assumptions
+
+
+FELT_LAYER = resistance_mass_transfer_impedance_parameters(resistance_pa_s_per_m=125.0, mass_kg_per_m2=0.004)
+
+
+def _fixture_system_with_layer(boundary_id: str = "boundary:fem-interface", parameters=FELT_LAYER):
+    system = _fixture_system()
+    return replace(
+        system,
+        boundaries=tuple(
+            replace(boundary, parameters=parameters) if boundary.id == boundary_id else boundary
+            for boundary in system.boundaries
+        ),
+    )
+
+
+def _layer_request(compiled, frequency_hz: float = 500.0) -> SystemSolveRequest:
+    return SystemSolveRequest(
+        compiled_system=compiled,
+        frequencies_hz=(frequency_hz,),
+        excitation_port_ids=("excitation:radiator",),
+        outputs=(
+            OutputRequest(id="output:fem", quantity="fem_nodal_pressure"),
+            OutputRequest(id="output:velocity", quantity="interface_average_normal_velocity"),
+        ),
+    )
+
+
+def test_coupled_backend_accepts_transfer_impedance_on_the_bounded_interface_boundary() -> None:
+    compiled = PhysicalSystemCompiler().compile(_fixture_system_with_layer())
+    session = CoupledProductionBackend(bem_backend="cpu").create_system_session(_layer_request(compiled))
+
+    boundary = next(
+        boundary for boundary in session.request.compiled_system.boundaries if boundary.id == "boundary:fem-interface"
+    )
+    assert boundary.parameters == FELT_LAYER
+    wire = system_solve_request_to_dict(session.request)
+    wire_boundary = next(
+        boundary for boundary in wire["compiled_system"]["boundaries"] if boundary["id"] == "boundary:fem-interface"
+    )
+    assert wire_boundary["parameters"]["transfer_impedance"] == FELT_LAYER["transfer_impedance"]
+    assumptions = {item.statement for item in compiled.assumptions}
+    assert "Locally reacting thin transfer-impedance layers on FEM-BEM interfaces (R + i omega M)" in assumptions
+
+
+@pytest.mark.parametrize(
+    ("boundary_id", "parameters", "message"),
+    (
+        ("boundary:bem-interface", FELT_LAYER, "bounded \\(FEM\\) side"),
+        ("boundary:wall", FELT_LAYER, "requires an interface assignment"),
+        (
+            "boundary:fem-interface",
+            {"transfer_impedance": {"model": "resistance_mass", "resistance_pa_s_per_m": -1.0, "mass_kg_per_m2": 0.0}},
+            "non-negative",
+        ),
+    ),
+)
+def test_compiler_rejects_misplaced_or_invalid_transfer_impedance(boundary_id, parameters, message) -> None:
+    with pytest.raises(PhysicalModelCompileError, match=message):
+        PhysicalSystemCompiler().compile(_fixture_system_with_layer(boundary_id, parameters))
+
+
+def test_worker_without_the_capability_refuses_a_transfer_impedance_submission() -> None:
+    compiled = PhysicalSystemCompiler().compile(_fixture_system_with_layer())
+    wire = system_solve_request_to_dict(_layer_request(compiled))
+    ready = json.loads((Path(beat_contract.__file__).parent / "worker-v1.json").read_text(encoding="utf-8"))
+    ready["backends"] = {"cpu": {"available": True}}
+    assert "interface_transfer_impedance" in ready["optional_physics"]
+    negotiate_submission(ready, wire, "solve")
+
+    old_engine = {key: value for key, value in ready.items() if key != "optional_physics"}
+    with pytest.raises(WorkerCompatibilityError, match="transfer-impedance layers are unavailable"):
+        negotiate_submission(old_engine, wire, "solve")
+
+
+def test_one_shot_solver_path_refuses_transfer_impedance_before_starting_julia() -> None:
+    compiled = PhysicalSystemCompiler().compile(_fixture_system_with_layer())
+    session = CoupledReferenceBackend(
+        julia_executable="/nonexistent/julia", persistent_worker=False
+    ).create_system_session(_layer_request(compiled))
+
+    with pytest.raises(RuntimeError, match="persistent BEAT worker"):
+        list(session.solve_stream())
+
+
+def test_transfer_impedance_diagnostics_must_echo_the_requested_layers() -> None:
+    layered = _layer_request(PhysicalSystemCompiler().compile(_fixture_system_with_layer()))
+    plain = _layer_request(PhysicalSystemCompiler().compile(_fixture_system()))
+    reported = {
+        "phasor_convention": "exp(+i omega t)",
+        "normal_orientation": "bounded_region_outward",
+        "layers": [
+            {
+                "interface_id": "interface:port",
+                "boundary_id": "boundary:fem-interface",
+                "resistance_pa_s_per_m": 125.0,
+                "mass_kg_per_m2": 0.004,
+                "impedance_real_pa_s_per_m": 125.0,
+                "impedance_imag_pa_s_per_m": 12.566,
+            }
+        ],
+    }
+    check_transfer_impedance_diagnostics(layered, 500.0, {"interface_transfer_impedance": reported})
+    check_transfer_impedance_diagnostics(plain, 500.0, {})
+    with pytest.raises(RuntimeError, match="may have solved without them"):
+        check_transfer_impedance_diagnostics(layered, 500.0, {})
+    with pytest.raises(RuntimeError, match="request without any"):
+        check_transfer_impedance_diagnostics(plain, 500.0, {"interface_transfer_impedance": reported})
+    float32_echo = {**reported, "layers": [{**reported["layers"][0], "mass_kg_per_m2": 0.004000000189989805}]}
+    check_transfer_impedance_diagnostics(layered, 500.0, {"interface_transfer_impedance": float32_echo})
+    altered = {**reported, "layers": [{**reported["layers"][0], "resistance_pa_s_per_m": 0.0}]}
+    with pytest.raises(RuntimeError, match="resistance_pa_s_per_m"):
+        check_transfer_impedance_diagnostics(layered, 500.0, {"interface_transfer_impedance": altered})
+
+
+@pytest.mark.skipif(
+    os.environ.get("BLAB_RUN_COUPLED_REFERENCE") != "1",
+    reason="Set BLAB_RUN_COUPLED_REFERENCE=1 to run the Julia transfer-impedance integration.",
+)
+def test_coupled_solve_with_a_transfer_impedance_layer_reports_it_and_changes_the_port_flow() -> None:
+    julia_executable = os.environ.get("BLAB_JULIA_EXE", "julia")
+    backend = CoupledReferenceBackend(julia_executable=julia_executable)
+    try:
+        plain = list(
+            backend.create_system_session(
+                _layer_request(PhysicalSystemCompiler().compile(_fixture_system()))
+            ).solve_stream()
+        )[0]
+        layered = list(
+            backend.create_system_session(
+                _layer_request(PhysicalSystemCompiler().compile(_fixture_system_with_layer()))
+            ).solve_stream()
+        )[0]
+    finally:
+        shutdown_beat_engine_workers()
+
+    assert "interface_transfer_impedance" not in plain.diagnostics
+    layer = layered.diagnostics["interface_transfer_impedance"]["layers"][0]
+    assert layer["boundary_id"] == "boundary:fem-interface"
+    assert layer["resistance_pa_s_per_m"] == 125.0
+    assert layer["mass_kg_per_m2"] == 0.004
+    # exp(+i omega t): Z_s = R + i omega M.
+    assert layer["impedance_imag_pa_s_per_m"] == pytest.approx(2.0 * np.pi * 500.0 * 0.004)
+    velocity = {quantity.id: quantity for quantity in plain.quantities}["output:velocity"].values
+    damped = {quantity.id: quantity for quantity in layered.quantities}["output:velocity"].values
+    assert np.all(np.isfinite(damped))
+    assert np.abs(damped - velocity).max() > 1e-3 * np.abs(velocity).max()
 
 
 def test_coupled_backend_rejects_unsupported_physical_roles_before_starting_julia() -> None:

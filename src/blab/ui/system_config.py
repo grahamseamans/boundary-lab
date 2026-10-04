@@ -33,7 +33,9 @@ from PySide6.QtWidgets import (
 from blab.acoustic_materials import (
     FEM_BULK_LOSS_FACTOR_OPTIONS,
     REGION_BULK_LOSS_FACTOR_KEY,
+    TRANSFER_IMPEDANCE_KEY,
     region_bulk_loss_factor,
+    transfer_impedance_parameters,
     wall_impedance_parameters,
 )
 from blab.component_symmetry import (
@@ -90,6 +92,19 @@ INTERFACE_SEAM_SIMPLIFICATION_WARNING = (
     "The result passed topology and element-quality checks, but local mesh quality may have changed. "
     "Visually inspect the conformed interface and its surrounding surface in the 3D viewport before solving."
 )
+
+
+def _saved_boundary_parameters(impedance_button, assignment) -> dict:
+    """Boundary parameters the dialog writes back: a wall lining on rigid walls, a layer on interfaces."""
+
+    if not isinstance(impedance_button, QPushButton):
+        return {}
+    parameters = dict(impedance_button.property("boundary_parameters") or {})
+    if assignment == BoundaryKind.RIGID and impedance_button.isEnabled():
+        return {key: value for key, value in parameters.items() if key != TRANSFER_IMPEDANCE_KEY}
+    if assignment == BoundaryKind.INTERFACE and TRANSFER_IMPEDANCE_KEY in parameters:
+        return {TRANSFER_IMPEDANCE_KEY: parameters[TRANSFER_IMPEDANCE_KEY]}
+    return {}
 
 
 @dataclass(frozen=True)
@@ -722,6 +737,14 @@ class SystemConfigDialog(QDialog):
 
     @staticmethod
     def _refresh_wall_impedance_button(button: QPushButton, assignment: QComboBox, bounded: bool) -> None:
+        layer = transfer_impedance_parameters(dict(button.property("boundary_parameters") or {}))
+        if layer is not None and assignment.currentData() == BoundaryKind.INTERFACE:
+            # Interface layers are authored in the project file; the dialog shows and keeps them.
+            button.setText(
+                f"Layer {float(layer['resistance_pa_s_per_m']):g} Pa·s/m / {float(layer['mass_kg_per_m2']):g} kg/m²"
+            )
+            button.setEnabled(False)
+            return
         treatment = wall_impedance_parameters(dict(button.property("boundary_parameters") or {}))
         button.setText(
             "None"
@@ -775,13 +798,7 @@ class SystemConfigDialog(QDialog):
                     region_id=region_id,
                     group=PhysicalGroupRef(mesh_id=mesh_id, dimension=2, name=group_name),
                     kind=BoundaryKind(combo.currentData()),
-                    parameters=(
-                        dict(impedance_button.property("boundary_parameters") or {})
-                        if isinstance(impedance_button, QPushButton)
-                        and combo.currentData() == BoundaryKind.RIGID
-                        and impedance_button.isEnabled()
-                        else {}
-                    ),
+                    parameters=_saved_boundary_parameters(impedance_button, combo.currentData()),
                 )
             )
         return tuple(boundaries)
